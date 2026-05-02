@@ -1,30 +1,66 @@
 """
 shared/agents.py
-All three RawatAI agents: Reflection, Habit, Context.
-Each agent is a function that takes input and returns a string.
+RawatAI agents: Reflection, Habit, Context.
+
+Fixes included:
+1) Azure OpenAI env key is flexible:
+   - AZURE_OPENAI_KEY
+   - AZURE_OPENAI_API_KEY
+
+2) Context Agent has deterministic schedule parsing before LLM fallback.
+   This makes demo inputs reliable, for example:
+   "My son has chemo every 21 days starting May 3 at 9 AM"
+
+3) Context Agent still falls back to Azure OpenAI JSON parsing for flexible cases.
+
+Expected env vars:
+- AZURE_OPENAI_ENDPOINT
+- AZURE_OPENAI_KEY or AZURE_OPENAI_API_KEY
+- AZURE_OPENAI_DEPLOYMENT
+- AZURE_OPENAI_API_VERSION optional, default 2024-02-01
 """
 
 import os
+import re
 import json
 import logging
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
 from openai import AzureOpenAI
+
 
 # ── Shared client ─────────────────────────────────────────────────
 _openai_client = None
+DEPLOYMENT = None
 
 
 def _get_client() -> AzureOpenAI:
+    """
+    Shared Azure OpenAI client.
+
+    Supports both env var names because previous code used AZURE_OPENAI_KEY,
+    while many Azure examples and earlier RawatAI config use AZURE_OPENAI_API_KEY.
+    """
     global _openai_client
+
     if _openai_client is None:
+        endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        api_key = os.environ.get("AZURE_OPENAI_KEY") or os.environ.get("AZURE_OPENAI_API_KEY")
+        api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01")
+
+        if not endpoint:
+            raise RuntimeError("Missing AZURE_OPENAI_ENDPOINT")
+        if not api_key:
+            raise RuntimeError("Missing AZURE_OPENAI_KEY or AZURE_OPENAI_API_KEY")
+
         _openai_client = AzureOpenAI(
-            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-            api_key=os.environ["AZURE_OPENAI_KEY"],
-            api_version="2024-02-01",
+            azure_endpoint=endpoint,
+            api_key=api_key,
+            api_version=api_version,
         )
+
     return _openai_client
-
-
-DEPLOYMENT = None
 
 
 def _get_deployment() -> str:
@@ -34,8 +70,12 @@ def _get_deployment() -> str:
     return DEPLOYMENT
 
 
-def _call(system: str, user: str, max_tokens: int = 200,
-          temperature: float = 0.7) -> str:
+def _call(
+    system: str,
+    user: str,
+    max_tokens: int = 200,
+    temperature: float = 0.7,
+) -> str:
     try:
         response = _get_client().chat.completions.create(
             model=_get_deployment(),
@@ -46,7 +86,8 @@ def _call(system: str, user: str, max_tokens: int = 200,
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        return response.choices[0].message.content.strip()
+        content = response.choices[0].message.content or ""
+        return content.strip()
     except Exception as e:
         logging.error(f"OpenAI call error: {e}")
         raise
@@ -170,6 +211,270 @@ Your purpose is to make self-care feel possible, not like another duty."""
 
 
 # ═══════════════════════════════════════════════════════════════════
+# CONTEXT AGENT — deterministic parser helpers
+# ═══════════════════════════════════════════════════════════════════
+
+MONTHS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+
+    # Indonesian month names
+    "januari": 1,
+    "februari": 2,
+    "maret": 3,
+    "april": 4,
+    "mei": 5,
+    "juni": 6,
+    "juli": 7,
+    "agustus": 8,
+    "september": 9,
+    "oktober": 10,
+    "november": 11,
+    "desember": 12,
+}
+
+TREATMENT_TYPES = {
+    "chemotherapy": [
+        "chemo", "chemotherapy", "kemoterapi", "kemo"
+    ],
+    "radiation": [
+        "radiation", "radiotherapy", "radiasi", "radioterapi"
+    ],
+    "surgery": [
+        "surgery", "operation", "operasi", "bedah"
+    ],
+    "immunotherapy": [
+        "immunotherapy", "imunoterapi"
+    ],
+}
+
+
+def _month_regex() -> str:
+    # Sort by length so "september" is evaluated before "sep".
+    return "|".join(sorted((re.escape(k) for k in MONTHS.keys()), key=len, reverse=True))
+
+
+def _parse_time_to_hhmm(text: str) -> str:
+    """
+    Parse common time forms:
+    - at 9 AM
+    - at 9:30 PM
+    - jam 9 pagi
+    - pukul 21.00
+    - 09:00
+
+    Defaults to 09:00 when no time is provided.
+    """
+    raw = str(text or "").lower().replace(".", ":")
+
+    # English forms: at 9 AM, at 9:30pm
+    match = re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", raw)
+    if not match:
+        # Indonesian forms: jam 9 pagi, pukul 21:00
+        match = re.search(
+            r"\b(?:jam|pukul)\s+(\d{1,2})(?::(\d{2}))?\s*(pagi|siang|sore|malam|am|pm)?\b",
+            raw,
+        )
+
+    # Standalone time, useful for "starting May 3 09:00"
+    if not match:
+        match = re.search(r"\b(\d{1,2}):(\d{2})\s*(am|pm)?\b", raw)
+
+    if not match:
+        return "09:00"
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = match.group(3)
+
+    if meridiem in ("pm", "sore", "malam") and hour < 12:
+        hour += 12
+    if meridiem in ("am", "pagi") and hour == 12:
+        hour = 0
+
+    # "siang" is ambiguous; keep 12 as 12, add 12 for 1-3 siang.
+    if meridiem == "siang" and 1 <= hour <= 3:
+        hour += 12
+
+    if hour > 23 or minute > 59:
+        return "09:00"
+
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _parse_month_day(text: str) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    Returns year, month, day.
+    Supports:
+    - May 3
+    - May 3, 2026
+    - 3 May
+    - 3 Mei 2026
+    - 2026-05-03
+    """
+    raw = str(text or "").lower()
+    months = _month_regex()
+
+    # Pattern: May 3, May 3 2026, May 3rd
+    match = re.search(
+        rf"\b({months})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?",
+        raw,
+    )
+    if match:
+        month = MONTHS[match.group(1)]
+        day = int(match.group(2))
+        year = int(match.group(3)) if match.group(3) else None
+        return year, month, day
+
+    # Pattern: 3 May, 3 Mei 2026
+    match = re.search(
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({months})(?:,?\s+(\d{{4}}))?",
+        raw,
+    )
+    if match:
+        day = int(match.group(1))
+        month = MONTHS[match.group(2)]
+        year = int(match.group(3)) if match.group(3) else None
+        return year, month, day
+
+    # Pattern: 2026-05-03 or 2026/05/03
+    match = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", raw)
+    if match:
+        return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+    return None, None, None
+
+
+def _detect_treatment_type(text: str) -> str:
+    raw = str(text or "").lower()
+
+    for treatment_type, keywords in TREATMENT_TYPES.items():
+        if any(keyword in raw for keyword in keywords):
+            return treatment_type
+
+    return "other"
+
+
+def _detect_patient_alias(text: str) -> Optional[str]:
+    raw = str(text or "").lower()
+
+    patterns = [
+        r"\bmy\s+(son|daughter|mother|mom|mum|father|dad|husband|wife|sister|brother|child|parent)\b",
+        r"\bibu saya\b",
+        r"\bayah saya\b",
+        r"\banak saya\b",
+        r"\bsuami saya\b",
+        r"\bistri saya\b",
+        r"\bmama saya\b",
+        r"\bpapa saya\b",
+        r"\bkakak saya\b",
+        r"\badik saya\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return match.group(0)
+
+    return None
+
+
+def _detect_cycle_days(text: str) -> Optional[int]:
+    raw = str(text or "").lower()
+
+    patterns = [
+        (r"\bevery\s+(\d+)\s+days?\b", 1),
+        (r"\bevery\s+(\d+)\s+weeks?\b", 7),
+        (r"\bsetiap\s+(\d+)\s+hari\b", 1),
+        (r"\bsetiap\s+(\d+)\s+minggu\b", 7),
+        (r"\bper\s+(\d+)\s+hari\b", 1),
+        (r"\bper\s+(\d+)\s+minggu\b", 7),
+    ]
+
+    for pattern, multiplier in patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return int(match.group(1)) * multiplier
+
+    # Common phrases
+    if re.search(r"\bevery\s+two\s+weeks\b|\bsetiap\s+dua\s+minggu\b", raw):
+        return 14
+    if re.search(r"\bevery\s+three\s+weeks\b|\bsetiap\s+tiga\s+minggu\b", raw):
+        return 21
+    if re.search(r"\bevery\s+four\s+weeks\b|\bsetiap\s+empat\s+minggu\b", raw):
+        return 28
+
+    return None
+
+
+def deterministic_schedule_parse(user_message: str) -> Optional[dict]:
+    """
+    Fast deterministic parser for common demo/user patterns.
+
+    Examples:
+    - My son has chemo every 21 days starting May 3 at 9 AM
+    - My mother has chemotherapy every 14 days starting April 30
+    - Anak saya kemoterapi setiap 21 hari mulai 3 Mei jam 9 pagi
+    - Chemo every 2 weeks starting 2026-05-03 09:00
+    """
+    raw = str(user_message or "").strip()
+    if not raw:
+        return None
+
+    now = datetime.now(timezone.utc)
+    cycle_days = _detect_cycle_days(raw)
+    year, month, day = _parse_month_day(raw)
+
+    # Without a recognizable date, let the LLM ask or infer more flexibly.
+    if not month or not day:
+        return None
+
+    if not year:
+        year = now.year
+
+    try:
+        date_candidate = datetime(year, month, day, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+    # If the date is already past and we know the cycle, compute next upcoming treatment.
+    if cycle_days:
+        while date_candidate.date() < now.date():
+            date_candidate += timedelta(days=cycle_days)
+    # If one-time/no cycle and the date is already past, assume next year's same date.
+    elif date_candidate.date() < now.date():
+        date_candidate = datetime(year + 1, month, day, tzinfo=timezone.utc)
+
+    hhmm = _parse_time_to_hhmm(raw)
+    next_treatment_date = f"{date_candidate.strftime('%Y-%m-%d')}T{hhmm}:00"
+
+    treatment_type = _detect_treatment_type(raw)
+    patient_alias = _detect_patient_alias(raw)
+
+    # High confidence if we found date + known treatment or cycle.
+    confidence = "high" if treatment_type != "other" or cycle_days else "medium"
+
+    return {
+        "patient_alias": patient_alias,
+        "treatment_type": treatment_type,
+        "next_treatment_date": next_treatment_date,
+        "cycle_days": cycle_days,
+        "confidence": confidence,
+        "clarifying_question": None,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # CONTEXT AGENT — Job 1: Parse schedule
 # ═══════════════════════════════════════════════════════════════════
 
@@ -181,7 +486,13 @@ def context_agent_parse(user_message: str) -> dict:
       patient_alias, treatment_type, next_treatment_date,
       cycle_days, confidence, clarifying_question
     """
-    from datetime import datetime, timezone
+
+    # 1) Deterministic parser first for stable hackathon/demo behavior.
+    deterministic = deterministic_schedule_parse(user_message)
+    if deterministic:
+        return deterministic
+
+    # 2) LLM fallback for less structured user messages.
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     system = f"""You are RawatAI's Context Agent. You never reply to the caregiver directly.
@@ -203,15 +514,18 @@ Return ONLY valid JSON with these exact keys:
 
 Rules:
 - If the start date is in the past and cycle_days is known, compute the next upcoming date.
-- If no time given, use T09:00:00.
+- If a date does not include a year, use the nearest upcoming date based on Today's date.
+- If no time is given, use T09:00:00.
 - If confidence is low, set clarifying_question to exactly ONE question. Never a list.
 - Never include prose, preamble, or explanation. JSON only.
 - If you cannot parse anything meaningful, return confidence: "low" with a clarifying question."""
 
+    raw = ""
+
     try:
         raw = _call(system, user_message, max_tokens=300, temperature=0.1)
 
-        # Strip markdown code fences if present
+        # Strip markdown code fences if present.
         raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -221,11 +535,20 @@ Rules:
 
         result = json.loads(raw)
 
-        # Validate required keys
-        required = ["patient_alias", "treatment_type", "next_treatment_date",
-                    "cycle_days", "confidence", "clarifying_question"]
+        # Validate required keys.
+        required = [
+            "patient_alias",
+            "treatment_type",
+            "next_treatment_date",
+            "cycle_days",
+            "confidence",
+            "clarifying_question",
+        ]
         for key in required:
             result.setdefault(key, None)
+
+        if not result.get("confidence"):
+            result["confidence"] = "medium" if result.get("next_treatment_date") else "low"
 
         return result
 

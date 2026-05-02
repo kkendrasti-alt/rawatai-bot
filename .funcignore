@@ -1,1 +1,11 @@
-
+.venv/
+.python_packages/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+local.settings.json
+test_agents_parser.py
+.DS_Store
