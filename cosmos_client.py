@@ -55,6 +55,23 @@ def get_caregiver(chat_id: str) -> dict | None:
         return None
 
 
+def list_caregivers(limit: int = 200) -> list[dict]:
+    """Fetch caregiver profiles for scheduler fan-out."""
+    try:
+        query = "SELECT * FROM c OFFSET 0 LIMIT @limit"
+        params = [{"name": "@limit", "value": limit}]
+        return list(
+            _container("caregivers").query_items(
+                query=query,
+                parameters=params,
+                enable_cross_partition_query=True,
+            )
+        )
+    except Exception as e:
+        logging.error(f"list_caregivers error: {e}")
+        return []
+
+
 def upsert_caregiver(chat_id: str, data: dict) -> None:
     try:
         data["id"] = chat_id
@@ -263,3 +280,19 @@ def get_journal_prompt(phase: str = "normal", lang: str = "en") -> str:
         "recovery_window": "The hardest days are often after. How is home?",
     }
     return fallbacks.get(phase, "What felt hardest today?")
+
+
+def save_nudge_event(chat_id: str, payload: dict) -> None:
+    """Persist scheduler-generated nudge payloads for delivery workers."""
+    try:
+        import uuid
+
+        doc = {
+            "id": str(uuid.uuid4()),
+            "chat_id": chat_id,
+            "created_at": now_iso(),
+            **payload,
+        }
+        _container("nudge_events").create_item(doc)
+    except Exception as e:
+        logging.error(f"save_nudge_event error: {e}")
